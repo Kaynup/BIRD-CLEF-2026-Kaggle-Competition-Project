@@ -2,3 +2,4 @@ data/raw/
 basic_kaggle_nbs_subs/
 *.py
 .ipynb_checkpoints
+scratch/
