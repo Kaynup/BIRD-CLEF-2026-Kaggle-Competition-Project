@@ -1,3 +1,4 @@
 data/raw/
-kaggle-notebooks/birdclef-2026-cnn.ipynb
+basic_kaggle_nbs_subs/
 *.py
+.ipynb_checkpoints
