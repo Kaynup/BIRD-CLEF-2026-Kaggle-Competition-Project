@@ -24,6 +24,8 @@ The pipeline focuses on:
 - leaderboard competitiveness,
 - scalability into ensembles and stacking later.
 
+It trains on the labeled clip set in `train.csv` plus the labeled soundscape segments in `train_soundscapes_labels.csv`, and writes submissions in the full official schema from `sample_submission.csv`.
+
 ---
 
 # Core Idea
