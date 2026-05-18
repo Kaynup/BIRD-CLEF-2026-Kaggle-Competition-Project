@@ -1,5 +1,7 @@
 data/raw/
 basic_kaggle_nbs_subs/
-*.py
+kaggle-pipelines/dark_arrowing_pipelines/*
 .ipynb_checkpoints
 scratch/
+*.pth
+__pycache__/
