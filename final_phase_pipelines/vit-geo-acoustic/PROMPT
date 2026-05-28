@@ -1,0 +1,603 @@
+Your current pipeline is already architecturally strong for BirdCLEF-style bioacoustic classification:
+
+multi-label acoustic classification
+geo-aware prior fusion
+ViT spectrogram encoder
+soundscape supervision
+leakage-safe CV
+secondary-label soft targets
+
+The main issue is not model quality.
+It is systems efficiency.
+
+The goal is:
+
+maximize GPU utilization
+minimize CPU preprocessing
+minimize redundant FFT work
+minimize dataloader stalls
+minimize memory fragmentation
+
+without changing:
+
+label quality
+augmentations
+model capacity
+validation fidelity
+
+Below is the compiled optimization blueprint for your exact pipeline.
+
+1. Biggest Current Bottlenecks
+
+Your training notebook currently spends huge time in:
+
+Component	Problem
+sf.read()	CPU-bound audio decode
+per-sample mel spectrogram	repeated FFT overhead
+F.interpolate() in dataset	CPU transforms
+normalization in dataset	CPU tensor ops
+ViT backbone	expensive attention compute
+no mixed precision	FP32 overhead
+sklearn KNN	slow inference scaling
+dataloader	likely starving GPU
+Python loops	overhead in validation
+2. Highest Impact Improvements
+
+These give the largest speedup WITHOUT weakening the model.
+
+A. Use Mixed Precision (MANDATORY)
+
+Current:
+
+FP32 training
+
+Should become:
+
+AMP FP16 training
+
+Add:
+
+scaler = torch.cuda.amp.GradScaler()
+
+Training:
+
+with torch.cuda.amp.autocast():
+    ac_out, geo_out = model(images)
+    loss = ...
+
+Backward:
+
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
+
+Expected:
+
+1.5–2.5× faster
+lower VRAM
+larger batch possible
+
+This is the single safest optimization.
+
+B. Move Spectrogram Pipeline OFF CPU
+
+Currently ALL this happens in Dataset workers:
+
+mel_spec = self.mel_transform(waveform)
+log_mel = torch.log(...)
+F.interpolate(...)
+normalize(...)
+
+This is very expensive.
+
+Better Architecture
+
+Dataset should return ONLY waveform + targets.
+
+Move ALL spectrogram processing to GPU training loop.
+
+Dataset:
+
+return waveform, coords, target
+
+Then inside training loop:
+
+waveforms = waveforms.to(device)
+
+with autocast():
+    mel = mel_transform(waveforms)
+
+Then:
+
+resize
+normalization
+masking
+
+ALL on GPU.
+
+This usually gives massive throughput improvement.
+
+C. Use Persistent Workers
+
+Current:
+
+DataLoader(... num_workers=4)
+
+Use:
+
+DataLoader(
+    ...,
+    num_workers=4,
+    pin_memory=True,
+    persistent_workers=True,
+    prefetch_factor=2
+)
+
+This avoids worker respawn every epoch.
+
+Important for Kaggle.
+
+D. Enable TF32
+
+On T4/A100/L4:
+
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+
+No meaningful accuracy loss.
+
+Often:
+
+10–30% speedup
+
+Especially ViTs.
+
+E. Compile the Model
+
+PyTorch 2.x:
+
+model = torch.compile(model)
+
+Especially good for:
+
+ViTs
+repeated static shapes
+
+Typical:
+
+10–25% faster
+F. Increase Batch Size
+
+You use:
+
+BATCH_SIZE = 16
+
+Very likely underutilizing GPU.
+
+After AMP:
+try:
+
+32
+48
+64
+
+until VRAM saturation.
+
+ViTs scale very well with larger batches.
+
+G. Use Channels Last
+
+After model creation:
+
+model = model.to(memory_format=torch.channels_last)
+
+Input tensors:
+
+images = images.to(memory_format=torch.channels_last)
+
+Good for:
+
+Conv layers
+ViT patch embedding
+3. Spectrogram-Level Optimizations
+
+These matter enormously.
+
+A. Precompute Mel Spectrograms (OPTIONAL BUT HUGE)
+
+Currently:
+
+every epoch recomputes FFTs
+
+This is expensive.
+
+You can precompute:
+
+waveform → mel → save .npy
+
+Then training loads mel tensors directly.
+
+Benefits:
+
+huge epoch speedup
+deterministic preprocessing
+
+Tradeoff:
+
+storage size increases
+
+This is one of the most common BirdCLEF optimizations.
+
+B. Cache Soundscape Mel Files
+
+Soundscapes are long and reused many times.
+
+Instead of:
+
+decoding full audio repeatedly
+
+Do:
+
+preprocess once
+save mel tensors
+
+Huge gain.
+
+C. Use Full-Audio Spectrogram Slicing
+
+Instead of:
+
+FFT per 5s crop
+
+Do:
+
+one full spectrogram
+slice spectrogram windows
+
+This avoids redundant FFT computation.
+
+Especially important for:
+
+overlapping windows
+soundscapes
+4. Dataloader Optimizations
+A. Avoid Resampler Creation Per Sample
+
+Current:
+
+resampler = T.Resample(sample_rate, CFG.SR)
+
+inside _load_audio.
+
+Very expensive.
+
+Instead:
+
+create global resampler cache
+
+Example:
+
+RESAMPLERS = {}
+
+Then reuse.
+
+B. Avoid Repeated Tensor Creation
+
+Current:
+
+torch.tensor(data)
+
+many times.
+
+Use:
+
+torch.from_numpy(data)
+
+Zero-copy.
+
+Faster.
+
+C. Avoid Min-Max Normalization Per Sample
+
+This:
+
+(log_mel - min)/(max-min)
+
+is expensive and unstable.
+
+Instead use:
+
+fixed normalization
+dataset-level mean/std
+
+This improves:
+
+stability
+speed
+consistency
+D. Use Non-Blocking GPU Transfer
+images = images.to(device, non_blocking=True)
+
+Requires:
+
+pin_memory=True
+
+in DataLoader.
+
+5. ViT-Specific Optimizations
+A. Use Smaller Patch Models
+
+Current:
+
+vit_base_patch16_224
+
+Alternatives:
+
+Model	Speed	Accuracy
+ViT-Base	slow	strong
+ViT-Small	faster	slightly lower
+ConvNeXt-Tiny	much faster	often competitive
+EfficientNet-B2	very fast	good
+
+Best compromise often:
+
+ConvNeXt
+
+for BirdCLEF.
+
+B. Freeze Early Layers Initially
+
+Epochs 1–2:
+
+for param in backbone.blocks[:6]:
+    param.requires_grad = False
+
+Benefits:
+
+faster backward
+stabilizes training
+
+Then unfreeze later.
+
+No major accuracy loss usually.
+
+C. Gradient Checkpointing
+
+If VRAM limited:
+
+model.set_grad_checkpointing(True)
+
+Trade:
+
+slower compute
+larger batch possible
+
+Useful only if memory bottlenecked.
+
+6. Geo-KNN Optimization
+
+Your current KNN is elegant but computationally expensive.
+
+A. Replace sklearn with FAISS
+
+Use:
+
+FAISS
+
+Especially for:
+
+large embedding banks
+many validation windows
+
+Massive speedup possible.
+
+B. Only Run KNN on Uncertain Predictions
+
+Current:
+
+KNN runs for ALL samples.
+
+Instead:
+
+uncertain_mask = max_prob < threshold
+
+Only run KNN there.
+
+Huge validation speedup.
+
+No quality loss.
+
+7. Validation Optimizations
+
+Validation is currently expensive.
+
+A. Vectorize KNN Fusion
+
+Current:
+
+for i in range(len(probs_visual)):
+
+Bad.
+
+Instead:
+
+mask = np.max(probs_visual, axis=1) <= threshold
+
+final_probs = probs_visual.copy()
+
+final_probs[mask] = (
+    probs_visual[mask] * (1 - alpha)
+    + probs_knn[mask] * alpha
+)
+
+Much faster.
+
+B. Avoid Repeated CPU Transfers
+
+Current:
+
+.cpu().numpy()
+
+many times.
+
+Keep tensors on GPU longer.
+
+Transfer once.
+
+8. Training Strategy Optimizations
+A. Cosine Scheduler
+
+You currently use fixed LR.
+
+Use:
+
+CosineAnnealingLR
+
+or:
+
+OneCycleLR
+
+Improves convergence efficiency.
+
+B. Gradient Accumulation
+
+If VRAM limited:
+
+effective_batch = batch_size * accumulation_steps
+
+Maintains optimization quality.
+
+C. EMA Weights
+
+Use:
+
+Exponential Moving Average
+
+Improves:
+
+generalization
+validation stability
+
+without slowing inference.
+
+9. Kaggle-Specific Optimizations
+A. Disable Internet Lookup
+
+Already done correctly:
+
+HF_HUB_OFFLINE=1
+
+Good.
+
+B. Save Intermediate Cached Files
+
+Save:
+
+mel spectrograms
+folds
+preprocessed metadata
+
+Avoid repeated notebook recomputation.
+
+C. Use Kaggle Dataset Versioning
+
+Turn:
+
+trained checkpoints
+cached mels
+
+into reusable Kaggle datasets.
+
+Huge workflow improvement.
+
+10. Things You SHOULD NOT Change
+
+These are currently GOOD.
+
+Keep
+StratifiedGroupKFold
+
+Very important.
+
+Avoids author leakage.
+
+Secondary label soft targets
+
+Excellent practice.
+
+Soundscape supervision
+
+Very valuable for leaderboard generalization.
+
+Geographic auxiliary task
+
+Good inductive bias.
+
+BCEWithLogitsLoss
+
+Correct for multi-label bird classification.
+
+Haversine metric
+
+Correct geographically.
+
+11. Highest ROI Upgrade Path
+
+If you want the BEST speedup/quality ratio:
+
+Tier 1 (Must Do)
+AMP mixed precision
+GPU mel pipeline
+persistent workers
+pin_memory
+non_blocking transfers
+larger batch size
+torch.compile
+
+These alone may give:
+
+2–4× throughput improvement.
+Tier 2 (Very Valuable)
+precompute mel spectrograms
+channels_last
+vectorized validation
+TF32
+FAISS
+Tier 3 (Advanced)
+ConvNeXt migration
+EMA
+dynamic thresholding
+pseudo-labeling
+curriculum sampling
+12. Most Important Architectural Insight
+
+Right now your pipeline is:
+
+CPU-heavy preprocessing
+→ GPU inference
+
+Modern efficient BirdCLEF systems are:
+
+minimal CPU work
+→ batched GPU preprocessing
+→ batched GPU training
+
+That architectural shift matters more than almost anything else.
+
+Recommended Final Stack
+
+For your exact project:
+
+Component	Recommended
+Backbone	ViT-Base OR ConvNeXt-Tiny
+Precision	AMP FP16
+FFT	GPU
+Resize	GPU
+Augmentations	GPU
+Batch	32–64
+Validation	vectorized
+KNN	FAISS
+Scheduler	cosine
+Memory Format	channels_last
+Compilation	torch.compile
+Workers	persistent
